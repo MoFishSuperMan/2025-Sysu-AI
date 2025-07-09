@@ -1,0 +1,693 @@
+\documentclass{article}
+\usepackage[UTF8]{ctex}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage[ruled,linesnumbered]{algorithm2e}
+\usepackage{algpseudocode} % 添加algorithmic包
+\usepackage{amsfonts} % 添加amsfonts包
+
+\geometry{a4paper, left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+% 代码块样式设置
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2,
+    frame=single,
+    framesep=10pt,
+    xleftmargin=20pt,
+    framexleftmargin=15pt
+}
+
+\lstset{style=mystyle}
+
+\title{基于孪生神经网络和OpenCV的残缺竹简的缀合}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文基于孪生神经网络的图片相似性学习，结合传统的OpenCV特征提取算法，实现了一种残断竹简缀合方法，并将该方法初步应用到《里耶秦简（二）》已缀合和未缀合的竹简残片图片集。
+出土竹简是了解我国古代历史、思想、制度、文化等的重要资料，但由于多种因素影响，竹简在埋藏过程中常常散乱断裂，给解读工作带来了较大的挑战。只有完整的竹简才能准确获取其中的历史信息，然而缀合工作常常需要人类专家人工完成，工作量较大。
+本文采用卷积神经网络和OpenCV的特征提取方法，提取竹简图片的全局特征和边缘特征，有效利用图片信息。通过孪生神经网络学习提取的特征，同时输出竹简对的对比损失函数。利用验证集的训练结果找到二分类阈值，完成竹简对能否缀合的判断。最后利用训练模型在未缀合图片中寻找可缀合图片。实验结果表明，本文方法能够一定程度上实现竹简的缀合。
+\end{abstract}
+
+\section{实验设计思路与代码}
+
+\subsection{数据加载与处理}
+
+在模型训练中，主要使用 \texttt{yizhuihe} 图片集中带有标签的图片进行训练。自定义数据集类 BambooSlipsDataset 读取图片集文件夹 \texttt{yizhuihe}，样本结构为 \texttt{((img1, img2), label)}。
+
+文件夹下面有多个子文件夹，每个文件夹中表示一组已经缀合的照片，我首先遍历每一个文件夹中已缀合的竹简，将他们两两组合成一个元组，同时赋予标签 1 来收集我们的正样本集，里面中的每一个样本中的两个图片都是可以缀合的
+然后我在文件夹中选择两个不同的组，并从其中分别选出一个竹简图片，同时赋予标签 0 作为我们的负样本集，里面中的每一个样本中的两个图片都是不可缀合的
+同时我控制了正负样本的数量都是一样的.
+
+\begin{lstlisting}[language=Python]
+# 图片集的读取与处理
+class BambooSlipsDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root_dir = root
+        self.transform = transform
+        self.groups = self.load_group()
+        self.postiive_pairs = self.generate_positive_pairs()
+        self.negative_pairs = self.generate_negative_pairs()
+        self.image_pairs = self.postiive_pairs + self.negative_pairs
+        self.labels = [1] * len(self.postiive_pairs) + [0] * len(self.negative_pairs)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img1_name, img2_name = self.image_pairs[idx]
+        label = self.labels[idx]
+        img1 = Image.open(img1_name).convert('RGB')
+        img2 = Image.open(img2_name).convert('RGB')
+        if self.transform:
+            img1, img2 = self.transform(img1), self.transform(img2)
+        return (img1, img2), label
+
+    def load_group(self):
+        '''loading group'''
+        groups = []
+        for group_name in os.listdir(self.root_dir):
+            group = os.path.join(self.root_dir, group_name)
+            if os.path.isdir(group):
+                image_files = [os.path.join(group,f) for f in os.listdir(group) if f.endswith(('.png', '.jpg', 'jpeg'))]
+                if image_files:
+                    groups.append(image_files)
+        return groups
+    
+    def generate_positive_pairs(self):
+        '''正样本对：已缀合的图片'''
+        positive_pairs = []
+        for group_images in self.groups:
+            if len(group_images) < 2:
+                continue
+
+            pairs = list(combinations(group_images, 2))
+            positive_pairs.extend(pairs)
+        return positive_pairs[0:int(len(positive_pairs) * 0.5)]
+
+    def generate_negative_pairs(self, num_negative_pairs=None):
+        negative_pairs = []
+        # 如果未指定数量，默认与正样本数量相同
+        if num_negative_pairs is None:
+            num_negative_pairs = int(len(self.postiive_pairs) * 0.5)
+        for _ in range(num_negative_pairs):
+            # 随机选择两个不同的组
+            group1, group2 = random.sample(self.groups, 2)
+            # 从每个组中随机选择一张图片
+            img1 = random.choice(group1)
+            img2 = random.choice(group2)
+            negative_pairs.append((img1, img2))
+        return negative_pairs
+\end{lstlisting}
+
+对样本中的竹简图片进行数据增强：
+\begin{lstlisting}[language=Python]
+# 图片信息的预处理
+transform = transforms.Compose([
+    # 调整短边为256像素
+    transforms.Resize(256),
+    # 数据增强
+    ## 随机裁剪并缩放
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+    ## 50%概率水平翻转
+    transforms.RandomHorizontalFlip(),
+    ## 随机旋转±15度
+    transforms.RandomRotation(15), 
+    # 转换为张量
+    transforms.ToTensor(),
+    # 归一化   
+    transforms.Normalize(       
+        mean=[0.485, 0.456, 0.406], 
+        std=[0.229, 0.224, 0.225]
+    )   
+])
+\end{lstlisting}
+
+在从文件中提取并处理图片数据集之后，我按照 8:1:1 的比例来划分成了训练集、验证集和测试集，并同时创建 loader
+\begin{itemize}
+    \item 训练集用于模型的训练
+    \item 验证集用于验证模型在训练过程中是否出现过拟合的现象
+    \item 测试集用于测试当前参数下模型的判断正确率
+\end{itemize}
+
+\begin{lstlisting}[language=Python]
+def SplitDataset(dataset):
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+    train_size = int(0.8 * dataset_size)
+    val_size = int(0.1 * dataset_size)
+    test_size = dataset_size - train_size - val_size
+    # 创建Subset对象
+    train_dataset = Subset(dataset, indices[:train_size])
+    val_dataset = Subset(dataset, indices[train_size:train_size + val_size])
+    test_dataset = Subset(dataset, indices[train_size + val_size:])
+    return train_dataset, val_dataset, test_dataset
+\end{lstlisting}
+
+\subsection{竹简缀合模型}
+
+\subsubsection{孪生神经网络}
+
+我们知道竹简的缀合问题的核心就在于如何判断两个竹简残片是不是可以缀合的，基于此，为了判断两个竹简是否可以缀合，我们可以通过判断两个竹简残片的相似程度来判断两个图片是否可以进行缀合，对于图片相似程度的判断，我选择使用孪生神经网络对前面构造的正负样本进行学习
+
+孪生神经网络的网络结构示意图：
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.5\textwidth]{image-1.png}
+\end{figure}
+
+\begin{lstlisting}[language=Python]
+class SiameseNN(nn.Module):
+    def __init__(self):
+        super(SiameseNN,self).__init__()
+        # 采用resnet18预训练模型作为孪生神经网络的主干网络
+        model = resnet18(pretrained=True)
+        # 卷积层
+        self.features=nn.Sequential(
+            model.conv1,
+            model.bn1,
+            model.relu,
+            model.maxpool,
+            model.layer1,
+            model.layer2,
+            model.layer3,
+            model.layer4,
+            model.avgpool
+        )
+
+        # 全连接层
+        self.classifier=nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512,256),
+            nn.ReLU(),
+            nn.Linear(256,128)
+        )
+    
+    def forward_once(self,x):
+        # 卷积层提取图片的特征减少处理的特征
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+    def forward(self,x1,x2):
+        output1 = self.forward_once(x1)
+        output2 = self.forward_once(x2)
+        return output1, output2
+\end{lstlisting}
+
+\subsubsection{对比损失函数}
+
+孪生神经网络的是判断两个图片相似性的网络结构，所以我采用了对比损失函数作为神经网络的损失函数
+
+\[
+Loss(D,Y)=\frac{1}{2N}\sum^{N}_{n=1}YD^2+(1-Y)\cdot\max(\text{margin}-D,0)^2
+\tag{1}
+\]
+
+其中，$Y$是样本对的标签（1表示可缀合，0表示不可缀合），$\text{margin}$是预定义阈值，用于控制不相似样本对的惩罚力度，$D$是两个特征向量之间的欧氏距离：
+\[
+D = \|f_1(x)-f_2(x)\|_2
+\tag{2}
+\]
+$f_1(x)$和$f_2(x)$是孪生网络提取的特征向量。
+
+\begin{lstlisting}[language=Python]
+# 对比损失函数（Contrastive Loss）
+class ContrastiveLoss(nn.Module):
+    '''ContrastuveLossFunction'''
+    def __init__(self, margin=1.0):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+    
+    def forward(self, output1, output2, label):
+        """
+        label: 标签 (batch_size, 1)，1表示可拼缀，0表示不可拼缀
+        """
+        # 欧式距离
+        euclidean_distance = torch.sqrt(torch.sum((output1 - output2) ** 2, dim=1, keepdim=True))
+        # 正样本:可拼缀的损失：距离的平方
+        piecable_loss = label * torch.pow(euclidean_distance, 2)
+        # 负样本:不可拼缀的损失：max(margin - distance, 0)的平方
+        inpiecable_loss = (1 - label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2)
+        # 平均损失
+        loss = torch.mean(piecable_loss + inpiecable_loss)
+        return loss
+\end{lstlisting}
+
+\subsubsection{OpenCV抓取关键点特征优化}
+
+在孪生神经网络中我使用了卷积神经网络(CNN)来作为孪生神经网络的主干网络，用于竹简图片的特征提取，但是有一个问题，CNN 通过卷积来提取特征的时候更多的全局的特征提取，更加倾向于保存整个图片的特征，但是在竹简缀合当中，应该更加倾向于提取边缘特征，比如说竹简的断口纹路，断口形状，显然 CNN 无法精确的提取到这些边缘特征
+
+为了优化这个问题，我想到了结合 OpenCV 方法来加强对边缘特征的提取
+
+OpenCV 作为传统的图像匹配的工具和方法，它能够通过特定的算法来提取图像中的特征点，比如残简的断口边缘曲线，它提供多种提取特征的方法，比如比如 SIFT、SURF 和 ORB 等，这些方法可以找到图像中的关键点，并计算出其描述子，描述子是用来描述关键点周围区域的向量，我们可以从图像中提取出一组有代表性的特征点和对应的描述子.
+
+我将这些提取出来的边缘特征与 CNN 中卷积提取的特征进行融合，并将其作为全连接网络层的输入，也就是让神经网络充分学习这个混合特征.
+
+OpenCV 对图像的特征抓取代码如下：
+
+\begin{lstlisting}[language=Python]
+class CVFeatureExtractionLayer(nn.Module):
+    def __init__(self, feature_type='sift', max_features=100, input_size=(3, 224, 224)):
+        super(CVFeatureExtractionLayer, self).__init__()
+        self.feature_type = feature_type
+        self.max_features = max_features
+        self.input_size = input_size
+        
+        # 初始化OpenCV特征提取器
+        if feature_type == 'sift':
+            self.extractor = cv2.SIFT_create(nfeatures=max_features)
+        elif feature_type == 'surf':
+            self.extractor = cv2.SURF_create()
+        elif feature_type == 'orb':
+            self.extractor = cv2.ORB_create(nfeatures=max_features)
+        else:
+            raise ValueError(f"不支持的特征类型: {feature_type}")
+        
+        # 计算特征维度
+        if feature_type == 'orb':
+            self.feature_dim = 32 * max_features
+        else:
+            self.feature_dim = 128 * max_features
+    
+    def forward(self, x):
+        """
+        前向传播方法
+        x: 输入图像张量 (batch_size, channels, height, width)
+        """
+        batch_size = x.size(0)
+        device = x.device
+        # 初始化输出张量
+        cv_features = torch.zeros(batch_size, self.feature_dim, device=device)
+        # 对批次中的每个图像进行特征提取
+        for i in range(batch_size):
+            # 将张量转换为PIL图像再转回OpenCV格式
+            img_tensor = x[i].cpu()  # 移到CPU进行处理
+            img_pil = transforms.ToPILImage()(img_tensor)
+            img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            # 转换为灰度图
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            # 检测关键点和计算描述符
+            kp, des = self.extractor.detectAndCompute(gray, None)
+            # 处理特征描述符
+            if des is None:
+                # 如果没有检测到特征，返回全零向量
+                feature_vector = torch.zeros(self.feature_dim, device=device)
+            else:
+                # 确保特征数量不超过max_features
+                if len(des) > self.max_features:
+                    des = des[:self.max_features]
+                else:
+                    # 不足则填充零
+                    padding = np.zeros((self.max_features - len(des), des.shape[1]), dtype=des.dtype)
+                    des = np.vstack((des, padding))
+                # 展平为一维向量
+                feature_vector = torch.from_numpy(des.flatten()).float().to(device)
+            # 保存到输出张量
+            cv_features[i] = feature_vector
+        return cv_features
+
+    def get_feature_dim(self):
+        """获取特征维度"""
+        return self.feature_dim
+\end{lstlisting}
+
+\subsubsection{基于阈值分类机制}
+
+由孪生神经网络的示意图可以看到，神经网络的输出是两个图片的对比损失函数，这是一个连续型的数值，但是二分类问题需要输出的是样本的类别，也就是输出离散的 0 或 1 对于这样的映射，可以通过寻找一个阈值，大于这个阈值的样本我们任务其 Loss 值过高，认为其不能够缀合，分类为 0 ，而小于这个阈值的样本我就认为其能够缀合
+
+接下来的问题就是如何确定这个阈值，这里我采用了贪心的方法，遍历集合中的所有对比损失函数将其认作为阈值，然后来对样本进行分类，再计算其准确率，然后我记录使得分类准确率最高的值作为模型的分类阈值，实现分类任务
+
+我将最后一次训练的验证集的输出作为寻找阈值的样本，并将其视为模型的阈值
+\begin{lstlisting}[language=Python]
+def FindOptimalThreshold(model, device, val_loader):
+    model.eval()
+    distances = []
+    labels = []
+
+    with torch.no_grad():
+        for (img_pair, label) in val_loader:
+            img1, img2 = img_pair
+            label = label.float().view(-1, 1).to(device)
+            img1, img2 = img1.to(device), img2.to(device)
+            # 前向传播
+            output1, output2 = model(img1, img2)
+            # 欧式距离
+            dist = torch.sqrt(torch.sum((output1 - output2) ** 2, dim=1))
+            distances.extend(dist.cpu().numpy())
+            labels.extend(label.cpu().numpy())
+    distances = np.array(distances)
+    labels = np.array(labels)
+    best_threshold = 0
+    best_accuracy = 0
+    for threshold in thresholds:
+        predictions = (distances < threshold).astype(int)
+        accuracy = np.mean(predictions == labels)
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_threshold = threshold
+    return best_threshold, best_accuracy
+\end{lstlisting}
+
+\subsection{缀合竹简寻找任务}
+
+训练完了匹配模型之后，最终的目的是为了在竹简中尝试进行缀合，前面我面建立模型来判断两个竹简残片能否缀合，这里在没有标签的竹简竹简图片中进行对竹简的缀合：
+\begin{itemize}
+\item 首先我们使用传统的数字图像处理的的方法，一个完整的竹简通常是有固定规则的形状的，比如下端削尖、上端圆弧、四边平整的长方形，而残断竹简通常四边都是有凹凸的断口，所以我采用了轮廓分析法来来对我们的\texttt{weizhuihe}图片集中的图片进行了是否为残缺竹简的进行分类，将残缺的竹简挑选出来
+\item 选择一张残缺竹简，寻找可缀合的竹简
+\item 然后我们遍历\texttt{weizhuihe}残缺竹简中的图片，将它与上一张竹简同时输入进我们训练好的孪生神经网络
+\item 然后我们通过分类器来判断其是否可以缀合，我们将其视为可能缀合的竹简
+\item 最后，我们筛选神经网络挑选的竹简，再进行人工挑选
+\end{itemize}
+
+对于完整竹简和残缺竹简的判断，我也是使用了轮廓分析和凸包检测的的方法来判断竹简是否残断，这一部分的工作主要是由类 IncompleteBambooSlipClassifier 来完成的.
+\begin{lstlisting}[language=Python]
+class IncompleteBambooSlipClassifier:
+    def __init__(self):
+        # 轮廓分析参数
+        self.contour_area_threshold = 1000  # 最小轮廓面积
+        # 角点检测参数
+        self.corner_defect_threshold = 0.1  # 角点缺陷阈值
+        self.corner_angle_threshold = 60    # 角点角度阈值
+        # 边缘检测参数
+        self.edge_straightness_threshold = 0.8  # 边缘直线度阈值
+
+    def analyze_slip(self, image):
+        """分析竹简图像并返回判断结果"""
+        try:
+            # 图像预处理
+            enhanced, cleaned = self.preprocess_image(image)
+            # 轮廓检测
+            contour = self.detect_main_contour(cleaned)
+            if contour is None:
+                # 没有检测到轮廓，可能是完整的竹简
+                return True, "未检测到轮廓，可能为完整简"
+            # 角点分析
+            corner_status = self.analyze_corners(contour)
+            # 边缘直线度分析
+            edge_straightness = self.analyze_edges(contour)
+            # 完整性判断
+            is_complete = self.is_complete_slip(corner_status, edge_straightness)
+            return is_complete
+        except Exception as e:
+            # 出错时默认返回完整简
+            return True, f"分析出错，默认完整简: {str(e)}"
+\end{lstlisting}
+
+最后的缀合工作由下面的代码完成：
+\begin{lstlisting}[language=Python]
+# 尝试在weizhuihe集中寻找可缀合的竹简
+analyzer = IncompleteBambooSlipClassifier()
+root = '../weizhuihe'
+incomplete_bambooships = []
+for img_name in os.listdir(root):
+    img = Image.open(img_name).convert('RGB')
+    is_complete = analyzer.analyze_slip(img)
+    if is_complete:
+        continue
+    else :
+        incomplete_bambooships.append(img_name)
+pairs = []
+for i in range(len(incomplete_bambooships)):
+    for j in range(i, len(incomplete_bambooships)):
+        img1 = Image.open(incomplete_bambooships[i])
+        img2 = Image.open(incomplete_bambooships[j])
+        img1, img2 = transform(img1), transform(img2)
+        model.eval()
+        img1, img2 = img1.to(device), img2.to(device)
+        output1, output2 = model(img1, img2)
+        dist = torch.sqrt(torch.sum((output1 - output2) ** 2, dim=1))
+        prediction = (dist < threshold).astype(int)
+        if prediction:
+            pairs.append((incomplete_bambooships[i],incomplete_bambooships[j]))
+        else :
+            continue
+print(pairs)
+\end{lstlisting}
+
+\section{模型框架与算法}
+
+\subsection{模型框架}
+本次实验的我所用的模型结合孪生神经网络、卷积神经网络、OpenCV 边缘特征抓取、阈值分类机制，形成了我本次实验所用的的竹简图片缀合判断模型，下面是模型结构示意图和算法伪代码
+
+模型结构示意图：
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{image.png}
+\end{figure}
+
+\subsection{算法}
+\begin{algorithm}[H]
+    \caption{OpenCV+孪生神经网络训练算法}
+    \SetAlgoLined
+    \KwIn{已缀合竹简数据集 $\mathcal{D}_{\text{train}} = \{(I_i, I_j, y_{ij})\}$，其中 $y_{ij} = 1$ 表示可缀合，$y_{ij} = 0$ 表示不可缀合，未缀合竹简数据集 $\mathcal{D}_{\text{test}}$}
+    
+    \KwResult{可缀合竹简对集合 $\mathcal{P}$}
+
+    \textbf{//模型训练}
+
+    初始化孪生神经网络 $f_{\theta}$，使用预训练的ResNet18作为骨干网络
+
+    初始化OpenCV特征提取器 $g_{\text{OpenCV}}$ (使用SIFT/SURF/ORB算法)
+
+    初始化对比损失函数 $\mathcal{L}_{\text{contrastive}}$，设置边界值 $m=1.0$
+
+    划分训练集 $\mathcal{D}_{\text{train}}$, 验证集 $\mathcal{D}_{\text{val}}$, 测试集 $\mathcal{D}_{\text{test}}$
+
+    \For{$epoch = 1$ \textbf{to} $E_{\max}$}{
+        \For{\textbf{each} batch $(I_i, I_j, y_{ij}) \in \mathcal{D}_{\text{train}}$}{
+        
+            \textbf{// 特征提取}
+
+            $F_i^{\text{CNN}} \gets f_{\theta}(I_i)$ \Comment{CNN提取全局特征}
+
+            $F_j^{\text{CNN}} \gets f_{\theta}(I_j)$
+
+            $F_i^{\text{CV}} \gets g_{\text{OpenCV}}(I_i)$ \Comment{OpenCV提取边缘特征}
+
+            $F_j^{\text{CV}} \gets g_{\text{OpenCV}}(I_j)$
+        
+            \textbf{// 特征融合}
+
+            $F_i \gets \text{Concat}(F_i^{\text{CNN}}, F_i^{\text{CV}})$
+
+            $F_j \gets \text{Concat}(F_j^{\text{CNN}}, F_j^{\text{CV}})$
+        
+            \textbf{// 计算距离和损失}
+
+            $d_{ij} \gets \|F_i - F_j\|_2$ \Comment{欧氏距离}
+
+            $\mathcal{L} \gets \mathcal{L}_{\text{contrastive}}(d_{ij}, y_{ij}, m)$
+        
+            \textbf{// 反向传播}
+
+            $\theta \gets \theta - \eta \nabla_{\theta} \mathcal{L}$ \Comment{更新网络参数}
+        }
+        \textbf{// 验证集评估}
+
+        在 $\mathcal{D}_{\text{val}}$ 上计算距离 $d_{ij}^{\text{val}}$
+
+        计算准确率 $\text{Acc}_{\text{val}}$
+    }
+
+    \textbf{// 确定最优阈值}
+
+    $\tau^* \gets \underset{\tau}{\arg\max} \sum_k \mathbf{1}[(d_k < \tau) = y_k]$ \Comment{最大化分类准确率}
+
+    \Return $\tau^*$
+\end{algorithm}
+
+\begin{algorithm}[H]
+    \caption{基于孪生神经网络和OpenCV的竹简缀合算法}
+    \SetAlgoLined
+    \textbf{// 阶段2：竹简缀合}
+
+    \For{\textbf{each} $I_i \in \mathcal{I}_{\text{incomplete}}$}{
+        \For{\textbf{each} $I_j \in \mathcal{I}_{\text{incomplete}}, j > i$}{
+            $F_i \gets \text{Concat}(f_{\theta}(I_i), g_{\text{OpenCV}}(I_i))$ \Comment{特征提取与融合}
+            $F_j \gets \text{Concat}(f_{\theta}(I_j), g_{\text{OpenCV}}(I_j))$
+            $d_{ij} \gets \|F_i - F_j\|_2$
+        
+            \If{$d_{ij} < \tau^*$}{
+            $\mathcal{P} \gets \mathcal{P} \cup \{(I_i, I_j)\}$ \Comment{添加可缀合对}
+            }
+        }
+    }
+\Return $\mathcal{P}$
+\end{algorithm}
+
+\subsection{算法关键步骤说明}
+
+\begin{itemize}
+\item \textbf{特征提取与融合}：算法同时使用CNN提取竹简的全局特征和OpenCV提取边缘特征，通过特征融合充分利用两种特征的优势：
+\begin{align*}
+F_i &= [f_{\theta}(I_i); g_{\text{OpenCV}}(I_i)] \\
+F_j &= [f_{\theta}(I_j); g_{\text{OpenCV}}(I_j)]
+\end{align*}
+
+\item \textbf{对比损失函数}：使用公式(1)定义的对比损失函数：
+\[
+\mathcal{L} = \frac{1}{2N} \sum_{ij} y_{ij} d_{ij}^2 + (1 - y_{ij}) \max(m - d_{ij}, 0)^2
+\]
+
+\item \textbf{阈值确定}：通过最大化验证集准确率确定最优分类阈值：
+\[
+\tau^* = \frac{1}{|\mathcal{D}_{\text{val}}|} \sum_{(i,j) \in \mathcal{D}_{\text{val}}} \mathbb{I}[(d_{ij} < \tau) = y_{ij}]
+\]
+
+\item \textbf{缀合决策}：对于测试竹简对，决策函数为：
+\[
+\text{Decision}(I_i, I_j) = \begin{cases} 
+\text{可缀合} & \text{if } d_{ij} < \tau^* \\
+\text{不可缀合} & \text{otherwise}
+\end{cases}
+\]
+
+\item \textbf{时间复杂度}：训练阶段为$O(|\mathcal{D}_{\text{train}}|)$，缀合阶段为$O(|\mathcal{I}_{\text{incomplete}}|^2)$，可通过聚类或近似最近邻搜索优化
+\end{itemize}
+
+\section{实验结果}
+
+\subsection{训练集与验证集合的Loss曲线}
+
+我记录了在训练过程时训练集和验证集的 Loss 变化曲线
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Figure_1.png}
+\end{figure}
+
+\subsection{消融实验}
+
+本次实验我使用 OpenCV + SiameseNetwork 的混合方法来抓取竹简图片的特征，这里将对比单一特征成分和混合特征成分对于模型的 Loss 曲线来验证混合特征方法的有效性
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{Figure_2.png}
+\end{figure}
+
+可以看到学习竹简的混合特征的神经网络（红色的正方形曲线），在收敛时有着更低的 Loss 值，这说明了本次实验所使用的混合特征的方法对于原本学习单一特征的方法有着一定的提升
+
+\subsection{距离阈值分类器效果}
+
+前面提到了对于孪生神经网络的输出对比损失函数，我们通过贪心的方式用最后一次验证集的阈值作为最后训练后的模型的阈值，用于判断竹简对是否可以缀合，用数学公式来讲的话就是如果一个竹简对满足下面的式子，那么阈值分类器就会将竹简对判断为可缀合的标签
+\[
+D_i=\|f_1(x)-f_2(x)\|_2 \leq \text{threshold}
+\]
+仔细观察这个公式，我们可以发现：
+\[
+f_2(x)-\sqrt{\text{threshold}} \leq f_1(x) \leq  f_2(x) + \sqrt{\text{threshold}}
+\]
+
+也就是说在$f_1(x)$-$f_2(x)$平面中，直线$y=x \pm \sqrt{\text{threshold}}$之间的点被判断为可缀合（1）。靠近$y=x$的点特征输出越相近，越可能配对成功。
+
+这是合理的，因为在平面中越靠近 $y=x$则说明两个图片的特征输出越相近，那么就越可能配对成功，这一思想与支持向量机 SVM 很像
+
+下图是在测试集上的分类效果：红色的三角形是测试集中可缀合的样本，而蓝色的空心圆圈是不可缀合的样本，这是样本的分类情况，而我们获得的阈值会将图中的黑色虚线的窄带中的点全部判断为可缀合，其他的点全部判断为不可缀合，可以看到这种分类方法可以很好的对样本点进行二分类，基本上与真实的标签一致.
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{Figure_3.png}
+\end{figure}
+
+\subsection{残断简和完整竹简的分类器效果}
+
+在竹简缀合器模型中的，由 \texttt{IncompleteBambooSlipClassifier} 来完成残断简和完整简的判断，下面是该分类器的分类效果，我测试两张图片，一个是完整的一个非完整的，来初步测试效果，分类器输出的结果如下：
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.3\textwidth}
+\centering
+\includegraphics[width=0.3\linewidth]{0001_a.jpeg}
+\caption{完整竹简}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.45\textwidth}
+\centering
+\includegraphics[width=0.8\linewidth]{2327.jpg}
+\caption{非完整竹简}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.45\textwidth}
+\centering
+\includegraphics[width=\linewidth]{屏幕截图 2025-07-05 232717.png}
+\caption{分类器输出}
+\end{subfigure}
+\end{figure}
+
+\subsection{寻找缀合残缺竹简结果}
+
+我尝试使用了我所设计的竹简缀合器，在未缀合的图片数据集中尝试缀合残缺的竹简，找到了如下的一组缀合的竹简
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.45\textwidth}
+\centering
+\includegraphics[width=0.8\linewidth]{2327.jpg}
+\caption{竹简2327}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.45\textwidth}
+\centering
+\includegraphics[width=0.8\linewidth]{2877_b.jpg}
+\caption{竹简2877\_b}
+\end{subfigure}
+\end{figure}
+
+可以看到我所提出这种方法还是能够在一定程度上实现竹简的缀合
+
+\section{不足与改进方向}
+本文提出了一种基于孪生神经网络和OpenCV的残缺竹简缀合方法。该方法通过融合CNN提取的全局特征和OpenCV提取的边缘特征，有效提高了竹简残片匹配的准确率。实验结果表明，该方法在《里耶秦简（二）》数据集上取得了良好的效果，能够在一定程度上自动识别可缀合的竹简残片。
+
+然而，本方法仍存在一定的局限性和不足之处。
+\begin{itemize}
+    \item 本文算法是$O(n^2)$复杂度的实际上对于特别的大的数据集这个复杂度会带来效率的问题，这里我们 `weizhuihe` 图片集合只有 `3000` 多竹简，其中有很大一部分是完整简不在我们的缀合范围内，但是光是找出上面的一个例子也几乎花费了大量的时间来寻找
+    \item 本文在判断竹简是否完整的时候使用的方法，并不能完全的做到百分百的正确率，这可能会导致后续的效率问题
+    \item 引入近似最近邻搜索算法，降低计算复杂度
+    \item 探索更有效的特征融合策略，进一步提高匹配准确率
+\end{itemize}
+
+在未来如果有机会的话，希望可以加强改进以下方面，更加的完善关于使用人工智能的方法实现竹简的缀合问题
+\begin{itemize}
+    \item 结合数据结构的知识，降低匹配的时间复杂度，比如通过近似最近邻搜索算法来降低计算复杂度
+    \item 探索更有效的特征融合策略，进一步提高匹配准确率
+\end{itemize}
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+\bibitem{ref1} Zhou, R., Xia, D., Zhang, Y., Pang, H., Yang, X., Li, C. (2023). PairingNet: A Learning-based Pair-searching and -matching Network for Image Fragments. arXiv:2312.08704 [cs.CV].
+\bibitem{ref2} Zhang, Z., Zhang, H., Guo, A., Jiao, Q., Liu, Y., Li, B., Gao, F. (2025). Deep rejoining model and dataset of oracle bone fragment images. npj Heritage Science, 13, 66.
+\bibitem{ref3} https://zhuanlan.zhihu.com/p/35040994
+\bibitem{ref4} Xie, G. B., Lu, W. (2013). Image Edge Detection Based on Opencv. International Journal of Electronics and Electrical Engineering, 1(2), 104-106. doi:10.12720/ijeee.1.2.104-106
+\bibitem{ref5} Yahilu, J. M., Kim, Y. B., Kim, J. N. (2019). classification of 3d film patterns with deep learning. Journal of Computer and Communications, 7(12).
+\end{thebibliography}
+
+\end{document}
